@@ -1,4 +1,6 @@
 services:
   nginx:
     ports:
-      - "80:80"
+      # bound to localhost only: Plesk's own web server owns the public
+      # 80/443 ports on this host and reverse-proxies to this port instead.
+      - "127.0.0.1:8080:80"
