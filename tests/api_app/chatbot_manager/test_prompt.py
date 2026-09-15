@@ -8,10 +8,11 @@ and covers all registered tools — no LLM inference is performed.
 """
 
 from pathlib import Path
+from unittest.mock import patch
 
 from django.test import TestCase
 
-from api_app.chatbot_manager.agent.agent import _SYSTEM_PROMPT, PROMPT
+from api_app.chatbot_manager.agent.agent import _SYSTEM_PROMPT, build_agent
 from api_app.chatbot_manager.agent.tools import build_tools
 from certego_saas.apps.user.models import User
 
@@ -52,11 +53,17 @@ class SystemPromptTestCase(TestCase):
         )
 
     def test_prompt_under_token_limit(self):
-        """System prompt must stay under 500 tokens to leave room for tool schemas
-        and conversation history within Ollama's 8192 context window.
+        """Cap the prompt so the tool schemas and the conversation history still fit in
+        Ollama's 8192-token context window.
+
+        The bound counts whitespace-separated WORDS, not tokens — for this text roughly 1.3-1.4
+        tokens per word, so 600 words is about 850 tokens, near a tenth of the window. The
+        original 500 was set when the prompt was 430 words; it had shrunk to 8 words of headroom
+        and was rejecting further rules rather than protecting the window, so it is raised here
+        together with the rule that needed the room.
         """
-        tokens = len(_SYSTEM_PROMPT.split())
-        self.assertLess(tokens, 500, f"system prompt is {tokens} tokens — exceeds 500")
+        words = len(_SYSTEM_PROMPT.split())
+        self.assertLess(words, 600, f"system prompt is {words} words — exceeds 600")
 
     def test_prompt_includes_all_tool_names(self):
         """Every registered tool appears in the [Tools] section, and the hardcoded
@@ -78,20 +85,39 @@ class SystemPromptTestCase(TestCase):
                 f"Tool '{name}' not found in system_prompt.txt — add it to the [Tools] section",
             )
 
-    def test_prompt_is_part_of_the_chat_template(self):
-        """The loaded prompt content is embedded in the ChatPromptTemplate's
-        system message, so the agent actually sees the file content at runtime.
+    def test_prompt_is_passed_to_the_agent(self):
+        """build_agent hands the file content to create_agent as the system prompt, so the agent
+        actually sees it at runtime (ChatOllama/create_agent are mocked — no Ollama is touched).
         """
-        # PROMPT.messages[0] is a SystemMessagePromptTemplate; its .prompt.template
-        # carries the system text (with {page_context} appended).
-        system_msg = PROMPT.messages[0]
-        template = system_msg.prompt.template
-        self.assertIn(_SYSTEM_PROMPT, template)
+        user, _ = User.objects.get_or_create(username="prompt_build_user")
+        with (
+            patch("api_app.chatbot_manager.agent.agent.ChatOllama"),
+            patch("api_app.chatbot_manager.agent.agent.create_agent") as mock_create,
+        ):
+            build_agent(user=user)
+        self.assertIn(_SYSTEM_PROMPT, mock_create.call_args.kwargs["system_prompt"])
 
     def test_prompt_sections_are_present(self):
         """Each planned section header appears so the structure is enforced."""
         for section in ("[Role]", "[Tools", "[Rules]", "[Response style]"):
             self.assertIn(section, _SYSTEM_PROMPT, f"Missing section: {section}")
+
+    def test_prompt_forbids_placeholder_names(self):
+        """A2: the [Rules] section must tell the model to copy analyzer/playbook/job names verbatim
+        and never emit bracketed placeholders like [Analyzer 1] — the qwen2.5:3b failure @mlodic hit.
+        """
+        lowered = _SYSTEM_PROMPT.lower()
+        self.assertIn("verbatim", lowered)
+        self.assertIn("placeholder", lowered)
+
+    def test_prompt_tells_model_to_surface_plan_reason(self):
+        """F2: the plan carries a `reason` when analyze_observable defaults a playbook, but the model
+        only narrates it if the prompt says to. The [Rules] section must instruct it to report the
+        reason in the confirmation message.
+        """
+        lowered = _SYSTEM_PROMPT.lower()
+        self.assertIn("reason", lowered)
+        self.assertIn("why that playbook was chosen", lowered)
 
     def test_page_context_not_in_the_file(self):
         """The file must NOT contain {page_context} — interpolation is the prompt

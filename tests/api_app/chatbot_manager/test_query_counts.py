@@ -14,6 +14,7 @@ validation (platform code resolving analyzers/playbooks/connectors), not the cha
 so a guard there would be a brittle measure of someone else's query plan.
 """
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
@@ -27,6 +28,8 @@ from api_app.chatbot_manager.agent.tools import build_tools
 from api_app.chatbot_manager.models import ChatMessage, ChatSession
 from api_app.chatbot_manager.tasks import process_chat_message
 from api_app.choices import TLP, Classification
+from api_app.data_model_manager.enums import DataModelEvaluations
+from api_app.data_model_manager.models import DomainDataModel
 from api_app.investigations_manager.models import Investigation
 from api_app.models import Job
 from api_app.playbooks_manager.models import PlaybookConfig
@@ -106,6 +109,25 @@ class ToolQueryCountTestCase(TestCase):
                 parameters={},
             )
 
+    @staticmethod
+    def _add_reports_with_data_models(job, configs):
+        # Same as _add_reports but each report carries an evaluated DataModel, which is the
+        # dimension the verdict reader walks.
+        for config in configs:
+            data_model = DomainDataModel.objects.create(
+                evaluation=DataModelEvaluations.MALICIOUS.value, reliability=8
+            )
+            report = AnalyzerReport.objects.create(
+                report={},
+                job=job,
+                config=config,
+                status=AnalyzerReport.STATUSES.SUCCESS.value,
+                task_id=str(uuid4()),
+                parameters={},
+            )
+            report.data_model = data_model
+            report.save()
+
     def _make_playbook(self, name):
         # A user-owned starting playbook supporting DOMAIN, so recommend_playbook("domain") returns it.
         return PlaybookConfig.objects.create(
@@ -174,6 +196,20 @@ class ToolQueryCountTestCase(TestCase):
         self.summarize_job.invoke({"job_id": job.pk})  # warm up
         small = _count_queries(lambda: self.summarize_job.invoke({"job_id": job.pk}))
         self._add_reports(job, configs[1:6])
+        large = _count_queries(lambda: self.summarize_job.invoke({"job_id": job.pk}))
+        self.assertEqual(small, large)
+
+    def test_summarize_job_query_count_is_constant_in_data_models(self):
+        # The verdict reader adds a fixed set of queries (live reconciliation + one queryset for
+        # the analyzer DataModels + one for the user events). Attribution goes through
+        # data_model_object_id instead of the report's GenericForeignKey precisely so this stays
+        # flat: resolving the FK per report would be a textbook N+1.
+        job = self._make_job()
+        configs = list(AnalyzerConfig.objects.all()[:6])
+        self._add_reports_with_data_models(job, configs[:1])
+        self.summarize_job.invoke({"job_id": job.pk})  # warm up
+        small = _count_queries(lambda: self.summarize_job.invoke({"job_id": job.pk}))
+        self._add_reports_with_data_models(job, configs[1:6])
         large = _count_queries(lambda: self.summarize_job.invoke({"job_id": job.pk}))
         self.assertEqual(small, large)
 
@@ -251,15 +287,22 @@ class ChatTaskQueryCountTestCase(TestCase):
         self.session = ChatSession.objects.create(user=self.user)
 
     @patch("api_app.chatbot_manager.tasks.get_channel_layer")
-    @patch("api_app.chatbot_manager.agent.agent.build_agent_executor")
+    @patch("api_app.chatbot_manager.agent.agent.build_agent")
     def test_process_chat_message_query_count_is_constant_in_history(self, mock_build, mock_get_layer):
+        from langchain_core.messages import AIMessage
+
         layer = MagicMock()
         layer.group_send = AsyncMock()
         mock_get_layer.return_value = layer
-        executor = MagicMock()
-        executor.invoke.return_value = {"output": "ok"}
-        executor.tools = []  # handler.tool_names = set(); no real tools needed
-        mock_build.return_value = executor
+
+        class _FakeRunnable:
+            # streams only the terminal state (no real tools / DB work), so the query count
+            # reflects the task's own history load + persistence, not the agent internals.
+            @staticmethod
+            def stream(inputs, stream_mode=None, config=None):
+                yield ("values", {"messages": [AIMessage(content="ok")]})
+
+        mock_build.return_value = SimpleNamespace(runnable=_FakeRunnable(), tool_names=frozenset())
 
         # Each call persists one user + one assistant message, so history grows naturally.
         process_chat_message(self.session.id, "hi", self.user.id)  # warm up
